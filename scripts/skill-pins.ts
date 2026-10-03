@@ -35,10 +35,15 @@ const GENERATE = 'pnpm run skill-pins:generate';
 const SYNC = 'pnpm run skill-pins:sync';
 
 const NPM_NAME = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
-// A package install or one-off run in a shell line (nc:run bodies).
-const NPM_INSTALL = /\b(?:(?:npm|pnpm|yarn|bun)\s+(?:install|add|i)|npx|pnpx|bunx|pnpm\s+dlx)(?=\s)/g;
+// A package install or one-off run in a shell line of any SKILL.md fence.
+const NPM_INSTALL =
+  /\b(?:(?:npm|pnpm|yarn|bun)\s+(?:install|add|i)|yarn\s+global\s+add|yarn\s+dlx|pnpm\s+dlx|npm\s+exec|bun\s+x|npx|pnpx|bunx)(?=\s)/g;
+// Installs proper (not one-off runs, which often reach a local binary).
+const NPM_ADD = /^(?:(?:npm|pnpm|yarn|bun)\s+(?:install|add|i)|yarn\s+global\s+add)$/;
 const PIP_INSTALL = /\b(?:pip3?|pipx|uv\s+pip|uv\s+tool)\s+install(?=\s)/g;
 const DOCKER_ARG = /^\s*ARG\s+([A-Z0-9_]*VERSION)=(\S+)/;
+const DOCKER_FROM = /^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?/i;
+const DOCKERFILE = /^(?:Dockerfile(?:\..+)?|.+\.dockerfile)$/i;
 const JSON_VERSION = /("version"\s*:\s*")([^"]*)(")/g;
 const MANIFEST_ENTRY_KEYS = new Set(['name', 'version', 'onlyBuilt']);
 const FOREIGN_MANIFESTS: Record<string, string> = {
@@ -146,7 +151,7 @@ function stripComment(line: string): string {
 /** Index of `token` as a whole shell word in the line's code part, if it occurs exactly once. */
 function wordIndex(line: string, token: string): number | undefined {
   const code = stripComment(line);
-  const hits = [...code.matchAll(new RegExp(`(?<=^|[\\s'"])${escapeRe(token)}(?=$|[\\s'"])`, 'g'))];
+  const hits = [...code.matchAll(new RegExp(`(?<=^|[\\s'"=])${escapeRe(token)}(?=$|[\\s'"])`, 'g'))];
   return hits.length === 1 ? hits[0].index : undefined;
 }
 
@@ -178,17 +183,26 @@ function shellWords(text: string, start: number): string[] {
 
 /** `name@version` words after an unquoted install verb, per shell segment. */
 export function installSpecs(line: string): string[] {
+  return npmWords(line).pinned;
+}
+
+/** Package words after unquoted install verbs: exact pins, and bare names an install adds unpinned. */
+function npmWords(line: string): { pinned: string[]; unpinned: string[] } {
   const text = stripComment(line);
   const mask = quoted(text);
-  const specs: string[] = [];
+  const pinned: string[] = [];
+  const unpinned: string[] = [];
   for (const m of text.matchAll(NPM_INSTALL)) {
     if (mask[m.index]) continue; // e.g. echo "never npm install x@1.0.0"
-    for (const token of shellWords(text, m.index + m[0].length)) {
+    const adds = NPM_ADD.test(m[0].replace(/\s+/g, ' '));
+    for (const word of shellWords(text, m.index + m[0].length)) {
+      const token = word.replace(/^--package=/, '');
       const spec = splitSpec(token);
-      if (spec && NPM_NAME.test(spec.name) && EXACT_SEMVER.test(spec.version)) specs.push(token);
+      if (spec && NPM_NAME.test(spec.name) && EXACT_SEMVER.test(spec.version)) pinned.push(token);
+      else if (adds && NPM_NAME.test(spec ? spec.name : token)) unpinned.push(token); // bare, a tag or a range
     }
   }
-  return specs;
+  return { pinned, unpinned };
 }
 
 function pipSpecs(line: string): string[] {
@@ -241,6 +255,27 @@ function manifestEntry(text: string): { name: string; version: string } | undefi
   const entry = obj as Record<string, unknown>;
   if (typeof entry.name !== 'string' || typeof entry.version !== 'string') return undefined;
   return { name: entry.name, version: entry.version };
+}
+
+/** `FROM` base images in Dockerfile lines, skipping earlier stages and variables. */
+function baseImages(file: string, lines: string[]): OtherPin[] {
+  const stages = new Set<string>();
+  const out: OtherPin[] = [];
+  for (const line of lines) {
+    const m = line.match(DOCKER_FROM);
+    if (!m) continue;
+    const image = m[1];
+    const earlierStage = stages.has(image.toLowerCase());
+    if (m[2]) stages.add(m[2].toLowerCase());
+    if (earlierStage || image.includes('$') || image === 'scratch') continue;
+    out.push({
+      pin: image,
+      kind: 'container image (Dockerfile FROM)',
+      source: file,
+      why: "a base image; Dependabot's docker ecosystem could read a Dockerfile, not configured",
+    });
+  }
+  return out;
 }
 
 export function scanSkill(file: string, markdown: string): Scan {
@@ -296,7 +331,23 @@ export function scanSkill(file: string, markdown: string): Scan {
       const { name, version } = splitSpec(spec)!;
       addNpm({ file, line, via, detail: guard, edit: 'spec' }, name, version);
     }
+    if (/^dockerfile$/i.test(fence.info)) {
+      scan.other.push(
+        ...baseImages(
+          file,
+          fence.body.map((b) => b.text),
+        ),
+      );
+    }
     for (const { text } of fence.body) {
+      for (const name of npmWords(text).unpinned) {
+        scan.other.push({
+          pin: name,
+          kind: 'unpinned npm install',
+          source: file,
+          why: 'installs whatever version is newest; pin an exact version so it can be tracked',
+        });
+      }
       const arg = text.match(DOCKER_ARG);
       if (arg && !arg[2].includes('$')) {
         scan.other.push({
@@ -402,6 +453,29 @@ export function scanSkillFiles(root: string, skillDir: string): Scan {
       });
       continue;
     }
+    if (DOCKERFILE.test(base)) {
+      scan.other.push(...baseImages(file, readFileSync(join(root, file), 'utf8').split('\n')));
+      continue;
+    }
+    if (base === 'package.json') {
+      let manifest: Record<string, unknown> = {};
+      try {
+        manifest = JSON.parse(readFileSync(join(root, file), 'utf8')) as Record<string, unknown>;
+      } catch {
+        scan.problems.push(`${file}: not valid JSON`);
+        continue;
+      }
+      const sections = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
+      if (sections.some((k) => Object.keys((manifest[k] as object | undefined) ?? {}).length)) {
+        scan.other.push({
+          pin: 'package.json',
+          kind: 'npm manifest',
+          source: file,
+          why: "Dependabot's npm ecosystem could read this directory itself; not configured",
+        });
+      }
+      continue;
+    }
     if (base !== 'versions.json') continue;
     const text = readFileSync(join(root, file), 'utf8');
     let values: unknown;
@@ -498,7 +572,7 @@ export function generate(scan: Scan): Generated {
   };
   const other = [...scan.other].sort((a, b) => byText(a.source, b.source)); // stable: file order kept
   const notCovered = {
-    description: `Generated by \`${GENERATE}\`: version pins in skills that no npm tool can track. Check these by hand.`,
+    description: `Generated by \`${GENERATE}\`: pins and installs in skills that no npm tool can track. Check these by hand.`,
     pins: other,
   };
   return {
@@ -577,7 +651,7 @@ const conflictReport = (conflicts: string[]) =>
   [
     'Skill pins and the shadow file both changed:',
     ...conflicts.map((c) => `  ${c}`),
-    `Set the version you want in the skill, then run \`${GENERATE}\`.`,
+    `Make the skill and ${MANIFEST} agree on the version you want, then run \`${SYNC}\`.`,
   ].join('\n');
 
 export function check(root: string): { ok: boolean; message: string } {
@@ -591,12 +665,24 @@ export function check(root: string): { ok: boolean; message: string } {
   if (conflicts.length) return { ok: false, message: conflictReport(conflicts) };
   if (!manifestOk && !stale.length && !bumped.length) stale.push('pin sources changed, or the file was edited');
   if (!notCoveredOk) stale.push(`${NOT_COVERED} is out of date`);
+  const loose = bumped.filter((b) => !EXACT_SEMVER.test(b.to));
+  if (loose.length) {
+    return {
+      ok: false,
+      message: [
+        `${MANIFEST} asks for versions that are not exact; skill pins must be:`,
+        ...loose.map((b) => `  ${b.name}: "${b.to}"`),
+        'Pin an exact version there, or close the update.',
+      ].join('\n'),
+    };
+  }
   if (bumped.length) {
     return {
       ok: false,
       message: [
         `${MANIFEST} was bumped without the skills it mirrors (a Dependabot update?):`,
         ...bumped.map((b) => `  ${b.name} ${b.from} -> ${b.to}, pinned at ${b.pins.map(where).join(', ')}`),
+        ...(stale.length ? ['Also out of date (sync regenerates these too):', ...stale.map((s) => `  ${s}`)] : []),
         `Run \`${SYNC}\` to write the new versions into the skills, then commit.`,
       ].join('\n'),
     };
@@ -781,22 +867,36 @@ export function sync(root: string): { ok: boolean; message: string } {
   return { ok: true, message: lines.join('\n') };
 }
 
-function runGenerate(root: string): { ok: boolean; message: string } {
-  const gen = generate(collect(root));
+/** Rewrites both files from the skills; refuses to drop pending Dependabot bumps unless `force`. */
+export function runGenerate(root: string, force = false): { ok: boolean; message: string } {
+  const scan = collect(root);
+  const gen = generate(scan);
   if (gen.problems.length) return { ok: false, message: problemReport(gen.problems) };
+  const { bumped } = classify(readShadow(root), groupPins(scan).pins);
+  if (bumped.length && !force) {
+    return {
+      ok: false,
+      message: [
+        `${MANIFEST} has bumps the skills don't have yet (a Dependabot update?):`,
+        ...bumped.map((b) => `  ${b.name} ${b.from} -> ${b.to}`),
+        `Run \`${SYNC}\` to keep them, or \`${GENERATE} --force\` to drop them.`,
+      ].join('\n'),
+    };
+  }
   writeGenerated(root, gen);
   return { ok: true, message: `Wrote ${MANIFEST} and ${NOT_COVERED}.` };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const force = process.argv.includes('--force');
   const modes: Record<string, (root: string) => { ok: boolean; message: string }> = {
-    '--generate': runGenerate,
+    '--generate': (root) => runGenerate(root, force),
     '--check': check,
     '--sync': sync,
   };
-  const run = modes[process.argv[2] ?? '--generate'];
+  const run = modes[process.argv.slice(2).find((a) => a !== '--force') ?? '--generate'];
   if (!run) {
-    console.error('usage: tsx scripts/skill-pins.ts [--generate | --check | --sync]');
+    console.error('usage: tsx scripts/skill-pins.ts [--generate [--force] | --check | --sync]');
     process.exitCode = 2;
   } else {
     const result = run(process.cwd());

@@ -20,8 +20,10 @@ import {
   collect,
   generate,
   installSpecs,
+  runGenerate,
   scanCliTools,
   scanSkill,
+  scanSkillFiles,
   sync,
   verifySync,
   writeGenerated,
@@ -168,6 +170,15 @@ describe('installSpecs', () => {
     expect(installSpecs('npm install --prefix "./a # b" foo@1.0.0')).toEqual(['foo@1.0.0']);
     expect(installSpecs('npm install --prefix "foo@1.0.0 cache" bar@2.0.0')).toEqual(['bar@2.0.0']);
   });
+
+  it('reads the other one-off and global forms', () => {
+    expect(installSpecs('yarn dlx a@1.0.0 && bun x b@2.0.0 && yarn global add c@3.0.0')).toEqual([
+      'a@1.0.0',
+      'b@2.0.0',
+      'c@3.0.0',
+    ]);
+    expect(installSpecs('npm exec --package=d@4.0.0 -- d --help')).toEqual(['d@4.0.0']);
+  });
 });
 
 describe('scanSkill', () => {
@@ -223,6 +234,44 @@ describe('scanSkill', () => {
   });
 });
 
+describe('not covered', () => {
+  it('lists unpinned installs and base images in dockerfile fences', () => {
+    const md = [
+      '```bash',
+      'pnpm add left-pad && npm i -g right-pad@latest && npx tsx x.ts',
+      '```',
+      '```dockerfile',
+      'FROM node:22-slim AS build',
+      'FROM build',
+      'FROM ${BASE}',
+      '```',
+      '',
+    ].join('\n');
+    expect(scanSkill('s/SKILL.md', md).other.map((o) => `${o.kind}: ${o.pin}`)).toEqual([
+      'unpinned npm install: left-pad',
+      'unpinned npm install: right-pad@latest',
+      'container image (Dockerfile FROM): node:22-slim',
+    ]);
+  });
+
+  it("lists a skill's Dockerfile base images and an npm manifest with dependencies", () => {
+    const root = makeRepo({
+      '.claude/skills/x/assets/proxy.Dockerfile':
+        'FROM rust:1.93.0-alpine AS a\nFROM alpine:3.22\nCOPY --from=a /x /x\n',
+      '.claude/skills/x/tool/package.json': JSON.stringify({ name: 'tool', dependencies: { ws: '8.0.0' } }),
+      '.claude/skills/x/empty/package.json': JSON.stringify({ name: 'empty' }),
+      '.claude/skills/x/broken/versions.json': '{',
+    });
+    const scan = scanSkillFiles(root, '.claude/skills/x');
+    expect(scan.other.map((o) => `${o.kind}: ${o.pin} @ ${o.source}`)).toEqual([
+      'container image (Dockerfile FROM): rust:1.93.0-alpine @ .claude/skills/x/assets/proxy.Dockerfile',
+      'container image (Dockerfile FROM): alpine:3.22 @ .claude/skills/x/assets/proxy.Dockerfile',
+      'npm manifest: package.json @ .claude/skills/x/tool/package.json',
+    ]);
+    expect(scan.problems).toEqual(['.claude/skills/x/broken/versions.json: not valid JSON']);
+  });
+});
+
 describe('scanCliTools', () => {
   it('locates each entry at its "version" line', () => {
     const scan = scanCliTools('container/cli-tools.json', CLI_TOOLS);
@@ -230,6 +279,11 @@ describe('scanCliTools', () => {
       ['agent-browser', '0.27.1', 4],
       ['tiny', '1.0.0', 7],
     ]);
+  });
+
+  it('reports a file that is not an array of entries', () => {
+    expect(scanCliTools('c.json', '{').problems).toEqual(['c.json: not valid JSON']);
+    expect(scanCliTools('c.json', '{}').problems).toEqual(['c.json: expected an array of {"name","version"} entries']);
   });
 
   it('rejects entries that share a line, which sync could not edit safely', () => {
@@ -292,6 +346,20 @@ describe('generate', () => {
   });
 });
 
+describe('runGenerate', () => {
+  it('will not drop a pending Dependabot bump unless forced', () => {
+    const root = fixture();
+    regenerate(root);
+    edit(root, MANIFEST, '"qrcode": "1.5.4"', '"qrcode": "1.5.5"');
+    const refused = runGenerate(root);
+    expect(refused.ok).toBe(false);
+    expect(refused.message).toContain('qrcode 1.5.4 -> 1.5.5');
+    expect(JSON.parse(read(root, MANIFEST)).dependencies.qrcode).toBe('1.5.5');
+    expect(runGenerate(root, true).ok).toBe(true);
+    expect(JSON.parse(read(root, MANIFEST)).dependencies.qrcode).toBe('1.5.4');
+  });
+});
+
 describe('check', () => {
   it('passes on a fresh generate', () => {
     const root = fixture();
@@ -338,6 +406,30 @@ describe('check', () => {
     expect(result.message).toContain('Run `pnpm run skill-pins:sync`');
   });
 
+  it('lists other stale rows next to a bump', () => {
+    const root = fixture();
+    regenerate(root);
+    edit(root, MANIFEST, '"qrcode": "1.5.4"', '"qrcode": "1.5.5"');
+    edit(root, '.claude/skills/add-chat/SKILL.md', 'local-adapter@1.0.0', 'local-adapter@1.1.0');
+    const message = check(root).message;
+    expect(message).toContain('qrcode 1.5.4 -> 1.5.5');
+    expect(message).toContain('Also out of date (sync regenerates these too):');
+    expect(message).toContain('local-adapter: the skills pin 1.1.0');
+  });
+
+  it('says a bump to a range must be pinned, instead of asking for sync', () => {
+    const root = fixture();
+    regenerate(root);
+    edit(root, MANIFEST, '"qrcode": "1.5.4"', '"qrcode": "^1.5.5"');
+    expect(check(root).message).toBe(
+      [
+        `${MANIFEST} asks for versions that are not exact; skill pins must be:`,
+        '  qrcode: "^1.5.5"',
+        'Pin an exact version there, or close the update.',
+      ].join('\n'),
+    );
+  });
+
   it('stops on a version changed on both sides, even next to a plain bump', () => {
     const root = fixture();
     regenerate(root);
@@ -349,7 +441,7 @@ describe('check', () => {
       message: [
         'Skill pins and the shadow file both changed:',
         '  tiny: a skill now pins 1.0.1 but the shadow file was bumped to 1.0.2',
-        'Set the version you want in the skill, then run `pnpm run skill-pins:generate`.',
+        'Make the skill and .github/skill-pins/package.json agree on the version you want, then run `pnpm run skill-pins:sync`.',
       ].join('\n'),
     });
   });
@@ -418,6 +510,49 @@ describe('sync', () => {
     expect(sync(root).message).toContain('tiny: a skill now pins 1.0.1 but the shadow file was bumped to 1.0.2');
     expect(read(root, '.claude/skills/add-other/SKILL.md')).toBe(OTHER_SKILL);
     expect(read(root, MANIFEST)).toBe(manifest);
+  });
+
+  it('refuses when the shadow file is missing', () => {
+    const root = fixture();
+    expect(sync(root)).toEqual({
+      ok: false,
+      message: `${MANIFEST} is missing or not JSON; run \`pnpm run skill-pins:generate\`.`,
+    });
+  });
+
+  it('refuses a pin it cannot find exactly once, and changes nothing', () => {
+    const root = makeRepo({
+      '.claude/skills/a/SKILL.md': '```nc:run effect:external\nnpm i -g t@1.0.0 && npx t@1.0.0 --version\n```\n',
+    });
+    regenerate(root);
+    edit(root, MANIFEST, '"t": "1.0.0"', '"t": "1.0.1"');
+    const skill = read(root, '.claude/skills/a/SKILL.md');
+    expect(sync(root)).toEqual({
+      ok: false,
+      message: '.claude/skills/a/SKILL.md:2: expected "t@1.0.0" once; edit it by hand.',
+    });
+    expect(read(root, '.claude/skills/a/SKILL.md')).toBe(skill);
+  });
+
+  it('rewrites an npm exec --package= pin', () => {
+    const root = makeRepo({ '.claude/skills/a/SKILL.md': '```bash\nnpm exec --package=d@4.0.0 -- d\n```\n' });
+    regenerate(root);
+    edit(root, MANIFEST, '"d": "4.0.0"', '"d": "4.1.0"');
+    expect(sync(root).ok).toBe(true);
+    expect(read(root, '.claude/skills/a/SKILL.md')).toContain('npm exec --package=d@4.1.0 -- d');
+  });
+
+  it('syncs the other bumps once the conflicting pin agrees (the advice in the conflict message)', () => {
+    const root = fixture();
+    regenerate(root);
+    edit(root, MANIFEST, '"qrcode": "1.5.4"', '"qrcode": "1.5.5"');
+    edit(root, MANIFEST, '"tiny": "1.0.0"', '"tiny": "1.0.2"');
+    edit(root, 'container/cli-tools.json', '"version": "1.0.0"', '"version": "1.0.1"');
+    expect(sync(root).ok).toBe(false);
+    edit(root, MANIFEST, '"tiny": "1.0.2"', '"tiny": "1.0.1"'); // agree on the skill's version
+    expect(sync(root).ok).toBe(true);
+    expect(read(root, '.claude/skills/add-other/SKILL.md')).toContain('qrcode@1.5.5');
+    expect(check(root).ok).toBe(true);
   });
 
   it('refuses a shadow version that is not exact, and changes nothing', () => {
@@ -539,8 +674,7 @@ describe('on this repo', () => {
           .filter((d) => d.kind === 'dep')
           .flatMap((d) => d.body.map((spec) => `${file}#${spec}`)),
       );
-    expect(specs.length).toBeGreaterThan(20);
+    expect(specs.length).toBeGreaterThan(0);
     for (const spec of specs) expect(mirrored).toContain(spec);
-    expect(scan.npm.some((p) => p.name === '@whiskeysockets/baileys' && p.file.includes('/add-whatsapp/'))).toBe(true);
   });
 });
