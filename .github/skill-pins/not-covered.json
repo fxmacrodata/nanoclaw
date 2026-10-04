@@ -68,7 +68,7 @@
       "why": "a download pinned by version; no Dependabot ecosystem reads it"
     },
     {
-      "pin": "onecli-gateway=1.41.0",
+      "pin": "onecli-gateway=1.42.0",
       "kind": "version",
       "source": ".claude/skills/add-onecli/versions.json",
       "why": "read by the skill's own scripts; Dependabot does not read versions.json"
