@@ -354,6 +354,35 @@ describe('fresh credential scope', () => {
       await expect(scope.lookup(docs)).rejects.toThrow();
     });
 
+    it('retries a failed save on the next read, so a restart still remembers the rule', async () => {
+      let failing = true;
+      let saved: CredentialRule[] = [];
+      const store = {
+        load: () => saved,
+        save: vi.fn((rules: CredentialRule[]) => {
+          if (failing) throw new Error('disk full');
+          saved = rules;
+        }),
+      };
+      const scope = new IronCredentialScope(
+        async (keep) => keep([githubRule]),
+        () => clock,
+        store,
+      );
+      await expect(scope.lookup(docs)).rejects.toThrow('disk full');
+      failing = false;
+      clock = 60_000;
+      expect(await scope.lookup(docs)).toBe('credential');
+      expect(saved).toContainEqual(githubRule);
+      clock = 120_000;
+      const restarted = new IronCredentialScope(
+        async () => {},
+        () => clock,
+        store,
+      );
+      expect(await restarted.lookup(github)).toBe('credential');
+    });
+
     it('rejects when a new rule cannot be recorded, but still covers it', async () => {
       const store = {
         load: () => [],

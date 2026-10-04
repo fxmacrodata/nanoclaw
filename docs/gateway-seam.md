@@ -396,9 +396,9 @@ applies only when all of these hold:
 A gateway derives `credentialScope` from its own credential rules. It may
 over-report and must never under-report, so it answers `'none'` only from rules
 at least as fresh as the ones its proxy enforces. A missing hook, an error, a
-timeout, a request that passes its deadline during the lookup, or any other
-answer keeps the card. Each card-free approval is logged with the request's
-audit metadata.
+timeout or any other answer keeps the card; a request whose deadline passes
+during the lookup is denied. Each card-free approval is logged with the
+request's audit metadata.
 
 This trades a human check for the egress allowlist. A request with no credential
 can still carry data out in its URL and headers to any allowed host, and GET is

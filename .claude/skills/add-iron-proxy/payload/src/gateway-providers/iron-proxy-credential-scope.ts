@@ -190,6 +190,8 @@ export class IronCredentialScope {
   #queued: Promise<void> | null = null;
   #watchingSince: number | null = null;
   #restored = false;
+  // Stays set until a save succeeds, so one failed write is retried on the next read.
+  #unsaved = false;
 
   constructor(
     private readonly load: (keep: RuleSink) => Promise<void>,
@@ -219,9 +221,16 @@ export class IronCredentialScope {
     const start = (): Promise<void> => {
       const startedAt = this.now();
       const read: Promise<void> = this.load((rules) => {
-        const before = this.#seen.size;
-        for (const rule of rules) this.#seen.set(JSON.stringify(rule), rule);
-        if (this.#seen.size > before) this.store?.save([...this.#seen.values()]);
+        for (const rule of rules) {
+          const key = JSON.stringify(rule);
+          if (this.#seen.has(key)) continue;
+          this.#seen.set(key, rule);
+          this.#unsaved = true;
+        }
+        if (this.#unsaved && this.store) {
+          this.store.save([...this.#seen.values()]);
+          this.#unsaved = false;
+        }
       })
         .then(() => {
           this.#watchingSince ??= startedAt;
