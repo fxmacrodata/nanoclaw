@@ -22,9 +22,8 @@ Without a key (free, no account, fair use 100 requests per day):
 
 - USD announcement data for the most recent 90 days; each release is readable
   15 minutes after publication
-- USD release calendar, USD press releases, and USD COT
-- For every currency: the data catalogue, forecast coverage, market sessions,
-  and risk sentiment
+- USD release calendar, USD press releases, and the USD data catalogue
+- For every currency: forecast coverage and market sessions
 
 Everything else (other currencies, FX rates, commodities, real-time releases,
 full history) needs an API key. Those tools return `subscription_required`
