@@ -390,7 +390,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     );
     const effectiveThreadId = threadsEnabled ? event.threadId : null;
 
-    const engages = await evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId);
+    const engages = await evaluateEngage(agent, messageText, isMention, event.message, mg, effectiveThreadId);
 
     const accessOk = engages && (!accessGate || (await accessGate(event, userId, mg, agent.agent_group_id)).allowed);
     const scopeOk = engages && (!senderScopeGate || (await senderScopeGate(event, userId, mg, agent)).allowed);
@@ -473,11 +473,18 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
  *                      session existence IS our subscription state; once
  *                      a thread has engaged us once, follow-ups arrive
  *                      with no mention and should still fire.
+ *   'new-thread'     — group chats only: platform mention, OR a message
+ *                      that starts a new thread, OR a follow-up in a
+ *                      thread that already has a session (as mention-sticky).
+ *                      Roots and follow-ups must be plain messages written
+ *                      by a human. No thread subscription: unsubscribed
+ *                      replies reach the router anyway.
  */
 async function evaluateEngage(
   agent: MessagingGroupAgent,
   text: string,
   isMention: boolean,
+  message: InboundEvent['message'],
   mg: MessagingGroup,
   threadId: string | null,
 ): Promise<boolean> {
@@ -499,6 +506,21 @@ async function evaluateEngage(
       // Sticky follow-up: session already exists for this (agent, mg, thread)
       // — the thread was activated before, keep firing.
       if (mg.is_group === 0) return false; // DMs never use mention-sticky sensibly
+      const existing = await findSessionForAgent(agent.agent_group_id, mg.id, threadId);
+      return existing !== undefined;
+    }
+    case 'new-thread': {
+      if (mg.is_group !== 1) return false;
+      if (isMention) return true;
+      // Without a thread id every message would share one session, so the
+      // follow-up arm below would engage on the whole channel.
+      if (threadId === null) return false;
+      // A root starts a session from nothing, so it needs the adapter to
+      // vouch for a human, plain message. A follow-up joins a session that
+      // already exists, so only an explicit bot/system flag blocks it:
+      // that stops two agents replying to each other in a loop.
+      if (message.isThreadRoot === true) return message.isBotAuthor === false && message.isSystemMessage === false;
+      if (message.isBotAuthor === true || message.isSystemMessage === true) return false;
       const existing = await findSessionForAgent(agent.agent_group_id, mg.id, threadId);
       return existing !== undefined;
     }
@@ -535,6 +557,20 @@ async function deliverToAgent(
     effectiveSessionMode = 'per-thread';
   }
 
+  // Command gate: classify slash commands before they reach the container.
+  // Filtered commands are dropped silently. Denied admin commands get a
+  // permission-denied response written directly to messages_out.
+  const gate =
+    event.message.kind === 'chat' || event.message.kind === 'chat-sdk'
+      ? await gateCommand(event.message.content, userId, agent.agent_group_id)
+      : null;
+  // new-thread follow-ups engage on session existence, so a root that will be
+  // dropped must not leave an empty session behind.
+  if (gate?.action === 'filter' && agent.engage_mode === 'new-thread') {
+    log.debug('Filtered command dropped by gate', { agentGroupId: agent.agent_group_id });
+    return;
+  }
+
   const { session, created } = await resolveSession(
     agent.agent_group_id,
     mg.id,
@@ -554,11 +590,7 @@ async function deliverToAgent(
     threadId: effectiveThreadId,
   };
 
-  // Command gate: classify slash commands before they reach the container.
-  // Filtered commands are dropped silently. Denied admin commands get a
-  // permission-denied response written directly to messages_out.
-  if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
-    const gate = await gateCommand(event.message.content, userId, agent.agent_group_id);
+  if (gate) {
     if (gate.action === 'filter') {
       log.debug('Filtered command dropped by gate', { agentGroupId: agent.agent_group_id });
       return;

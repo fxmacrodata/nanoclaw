@@ -108,7 +108,7 @@ pnpm exec tsx setup/index.ts --step register -- \
 
 The `register` step creates the agent group (reusing it if the folder already exists), the messaging group, and the wiring row. `createMessagingGroupAgent` auto-creates the companion `agent_destinations` row so the agent can address the channel by name.
 
-Omitted engage/policy fields default from the channel adapter's declaration (see "Channel Defaults" above). Optional overrides: `--trigger "<regex>"` (explicit engage pattern), `--engage-mode <pattern|mention|mention-sticky>`, `--is-group <true|false>`, `--unknown-sender-policy <strict|request_approval|public>`. Don't pick a mention mode on a channel whose declaration says `mentions: 'never'` — it can never engage there.
+Omitted engage/policy fields default from the channel adapter's declaration (see "Channel Defaults" above). Optional overrides: `--trigger "<regex>"` (explicit engage pattern), `--engage-mode <pattern|mention|mention-sticky|new-thread>`, `--is-group <true|false>`, `--unknown-sender-policy <strict|request_approval|public>`. Don't pick a mention mode on a channel whose declaration says `mentions: 'never'` — it can never engage there.
 
 New agent groups are created on the instance default provider (`DEFAULT_AGENT_PROVIDER` in `.env`, or `claude` when unset). To run a group on a different provider, switch it after creation with `ncl groups config update --provider <name>` (e.g. `codex`).
 

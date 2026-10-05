@@ -362,6 +362,118 @@ describe('validateEngageAgainstChannel — per-thread/threads coherence (ncl upd
   });
 });
 
+describe("validateEngageAgainstChannel — engage_mode 'new-thread'", () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(async () => {
+    const { teardownChannelAdapters } = await import('./channel-registry.js');
+    await teardownChannelAdapters();
+    vi.resetModules();
+  });
+
+  function makeMg(isGroup: boolean): MessagingGroup {
+    return {
+      id: 'mg-1',
+      channel_type: 'mock',
+      platform_id: 'mock:C1',
+      name: 'Chat',
+      is_group: isGroup ? 1 : 0,
+      unknown_sender_policy: 'strict',
+      created_at: new Date().toISOString(),
+    };
+  }
+
+  async function withGroupThreads(threads: boolean) {
+    const reg = await import('./channel-registry.js');
+    const defaults: ChannelDefaults = {
+      dm: { engageMode: 'pattern', engagePattern: '.', threads: true, unknownSenderPolicy: 'public' },
+      group: { engageMode: 'mention', threads, unknownSenderPolicy: 'strict' },
+      mentions: 'platform',
+    };
+    reg.registerChannelAdapter('mock', { factory: () => null, defaults });
+    return import('./channel-defaults.js');
+  }
+
+  it('accepts a group wiring whose thread policy resolves on', async () => {
+    const { validateEngageAgainstChannel } = await withGroupThreads(true);
+    const w = { engage_mode: 'new-thread', ignored_message_policy: 'drop' };
+    expect(() => validateEngageAgainstChannel(w, makeMg(true))).not.toThrow();
+    expect(w.engage_mode).toBe('new-thread');
+  });
+
+  it('rejects a DM conversation', async () => {
+    const { validateEngageAgainstChannel } = await withGroupThreads(true);
+    expect(() => validateEngageAgainstChannel({ engage_mode: 'new-thread' }, makeMg(false))).toThrow(
+      /group chats only/,
+    );
+  });
+
+  it('rejects an inherited thread policy that resolves off; an explicit threads=1 overrides it', async () => {
+    const { validateEngageAgainstChannel } = await withGroupThreads(false);
+    expect(() => validateEngageAgainstChannel({ engage_mode: 'new-thread' }, makeMg(true))).toThrow(
+      /requires honored thread ids/,
+    );
+    expect(() => validateEngageAgainstChannel({ engage_mode: 'new-thread', threads: 1 }, makeMg(true))).not.toThrow();
+  });
+
+  it('rejects an explicit threads=false on a threaded context', async () => {
+    const { validateEngageAgainstChannel } = await withGroupThreads(true);
+    expect(() => validateEngageAgainstChannel({ engage_mode: 'new-thread', threads: 0 }, makeMg(true))).toThrow(
+      /requires honored thread ids/,
+    );
+  });
+
+  it("rejects ignored_message_policy 'accumulate'", async () => {
+    const { validateEngageAgainstChannel } = await withGroupThreads(true);
+    expect(() =>
+      validateEngageAgainstChannel({ engage_mode: 'new-thread', ignored_message_policy: 'accumulate' }, makeMg(true)),
+    ).toThrow(/ignored_message_policy 'accumulate'/);
+  });
+
+  it("rejects session_mode 'agent-shared'", async () => {
+    const { validateEngageAgainstChannel } = await withGroupThreads(true);
+    expect(() =>
+      validateEngageAgainstChannel({ engage_mode: 'new-thread', session_mode: 'agent-shared' }, makeMg(true)),
+    ).toThrow(/session_mode 'agent-shared'/);
+  });
+
+  it('warns when the live adapter has no thread support', async () => {
+    const reg = await import('./channel-registry.js');
+    const defaults = makeDefaults('x', true);
+    reg.registerChannelAdapter('mock', {
+      factory: () => makeAdapter('mock', { supportsThreads: false, defaults }),
+      defaults,
+    });
+    await reg.initChannelAdapters(mockSetup);
+    const { log } = await import('../log.js');
+    const warn = vi.spyOn(log, 'warn');
+    const { validateEngageAgainstChannel } = await import('./channel-defaults.js');
+
+    validateEngageAgainstChannel({ engage_mode: 'new-thread', threads: 1 }, makeMg(true));
+
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/without thread support/), expect.anything());
+  });
+
+  it('does not warn when the live adapter supports threads', async () => {
+    const reg = await import('./channel-registry.js');
+    const defaults = makeDefaults('x', true);
+    reg.registerChannelAdapter('mock', {
+      factory: () => makeAdapter('mock', { supportsThreads: true, defaults }),
+      defaults,
+    });
+    await reg.initChannelAdapters(mockSetup);
+    const { log } = await import('../log.js');
+    const warn = vi.spyOn(log, 'warn');
+    const { validateEngageAgainstChannel } = await import('./channel-defaults.js');
+
+    validateEngageAgainstChannel({ engage_mode: 'new-thread' }, makeMg(true));
+
+    expect(warn).not.toHaveBeenCalled();
+  });
+});
+
 describe('resolveUnknownSenderPolicy', () => {
   beforeEach(() => {
     vi.resetModules();

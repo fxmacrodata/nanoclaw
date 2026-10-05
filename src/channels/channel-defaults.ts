@@ -15,7 +15,7 @@
  * Slack/Discord, and non-threaded group platforms have null threadIds).
  */
 import type { ChannelDefaults } from './adapter.js';
-import { getChannelDefaults, hasDeclaredChannelDefaults } from './channel-registry.js';
+import { getChannelAdapter, getChannelDefaults, hasDeclaredChannelDefaults } from './channel-registry.js';
 import { log } from '../log.js';
 import type { MessagingGroup } from '../types.js';
 
@@ -144,6 +144,7 @@ export interface EngageValues {
   engage_pattern?: unknown;
   threads?: unknown;
   session_mode?: unknown;
+  ignored_message_policy?: unknown;
 }
 
 /**
@@ -197,6 +198,8 @@ export function validateEngageAgainstChannel(w: EngageValues, mg: MessagingGroup
     }
   }
 
+  if (w.engage_mode === 'new-thread') validateNewThread(w, mg);
+
   if (w.engage_mode !== 'mention' && w.engage_mode !== 'mention-sticky') return;
 
   const channelKey = mg.instance ?? mg.channel_type;
@@ -218,5 +221,42 @@ export function validateEngageAgainstChannel(w: EngageValues, mg: MessagingGroup
       });
       w.engage_mode = 'mention';
     }
+  }
+}
+
+/**
+ * new-thread engages on thread roots and keys follow-ups on per-thread session
+ * existence, so it needs a group context with honored thread ids. Accumulate
+ * would store an un-engaged reply in a new per-thread session, which the
+ * follow-up check then reads as an engaged thread. agent-shared stores the
+ * session without a thread id, so the follow-up lookup never finds it.
+ * Errors, not coercions: no nearby mode keeps the operator's intent.
+ */
+function validateNewThread(w: EngageValues, mg: MessagingGroup): void {
+  if (mg.is_group !== 1) {
+    throw new Error(`engage_mode 'new-thread' applies to group chats only — this messaging group is a DM`);
+  }
+  if (w.ignored_message_policy === 'accumulate') {
+    throw new Error(`engage_mode 'new-thread' cannot be combined with ignored_message_policy 'accumulate'`);
+  }
+  if (w.session_mode === 'agent-shared') {
+    throw new Error(`engage_mode 'new-thread' cannot be combined with session_mode 'agent-shared'`);
+  }
+  const key = mg.instance ?? mg.channel_type;
+  const explicit = w.threads !== undefined && w.threads !== null;
+  const threads = explicit
+    ? w.threads !== 0 && w.threads !== false
+    : !hasDeclaredChannelDefaults(key, mg.channel_type) || getChannelDefaults(key, mg.channel_type).group.threads;
+  if (!threads) {
+    throw new Error(
+      `engage_mode 'new-thread' requires honored thread ids, but this wiring's thread policy resolves off — set --threads true`,
+    );
+  }
+  // Only a live adapter can be checked; offline creation stays silent.
+  if (getChannelAdapter(key)?.supportsThreads === false) {
+    log.warn("engage_mode 'new-thread' on an adapter without thread support — only mentions will engage", {
+      channel: key,
+      messagingGroupId: mg.id,
+    });
   }
 }

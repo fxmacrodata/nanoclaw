@@ -147,6 +147,48 @@ describe('wirings-create — validation', () => {
     const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1', engage_mode: 'mention-sticky' });
     expect(row.engage_mode).toBe('mention-sticky');
   });
+
+  it('accepts new-thread on a threaded group context', async () => {
+    const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1', engage_mode: 'new-thread' });
+    expect(row.engage_mode).toBe('new-thread');
+  });
+
+  it('rejects new-thread on a DM', async () => {
+    await expect(
+      create({ messaging_group_id: 'mg-dm', agent_group_id: 'ag-1', engage_mode: 'new-thread' }),
+    ).rejects.toThrow(/group chats only/);
+  });
+
+  it('rejects new-thread with --threads false or --ignored-message-policy accumulate', async () => {
+    await expect(
+      create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1', engage_mode: 'new-thread', threads: 'false' }),
+    ).rejects.toThrow(/requires honored thread ids/);
+    await expect(
+      create({
+        messaging_group_id: 'mg-group',
+        agent_group_id: 'ag-1',
+        engage_mode: 'new-thread',
+        ignored_message_policy: 'accumulate',
+      }),
+    ).rejects.toThrow(/ignored_message_policy 'accumulate'/);
+  });
+
+  it('rejects new-thread with --session-mode agent-shared', async () => {
+    await expect(
+      create({
+        messaging_group_id: 'mg-group',
+        agent_group_id: 'ag-1',
+        engage_mode: 'new-thread',
+        session_mode: 'agent-shared',
+      }),
+    ).rejects.toThrow(/session_mode 'agent-shared'/);
+  });
+
+  it('still rejects an unknown --engage-mode', async () => {
+    await expect(
+      create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1', engage_mode: 'bogus' }),
+    ).rejects.toThrow(/engage_mode must be one of: pattern, mention, mention-sticky, new-thread/);
+  });
 });
 
 describe('wirings — threads and priority columns', () => {
@@ -197,6 +239,19 @@ describe('wirings-update — same validation as create', () => {
     const updated = (await update({ id: row.id, threads: 'false' })) as { engage_mode: string; threads: number };
     expect(updated.threads).toBe(0);
     expect(updated.engage_mode).toBe('mention');
+  });
+
+  it('rejects turning off threads or switching to accumulate on a new-thread wiring', async () => {
+    const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1', engage_mode: 'new-thread' });
+    await expect(update({ id: row.id, threads: 'false' })).rejects.toThrow(/requires honored thread ids/);
+    await expect(update({ id: row.id, ignored_message_policy: 'accumulate' })).rejects.toThrow(
+      /ignored_message_policy 'accumulate'/,
+    );
+  });
+
+  it('rejects switching an agent-shared wiring to new-thread', async () => {
+    const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1', session_mode: 'agent-shared' });
+    await expect(update({ id: row.id, engage_mode: 'new-thread' })).rejects.toThrow(/session_mode 'agent-shared'/);
   });
 
   it('updates threads and priority', async () => {

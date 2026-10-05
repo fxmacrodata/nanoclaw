@@ -25,7 +25,7 @@ import { projectDestinationsToSessions } from './destinations.js';
  * reject e.g. `--engage-mode bogus`).
  */
 const CREATE_ENUMS: Record<string, string[]> = {
-  engage_mode: ['pattern', 'mention', 'mention-sticky'],
+  engage_mode: ['pattern', 'mention', 'mention-sticky', 'new-thread'],
   sender_scope: ['all', 'known'],
   ignored_message_policy: ['drop', 'accumulate'],
   session_mode: ['shared', 'per-thread', 'agent-shared'],
@@ -71,8 +71,8 @@ registerResource({
       name: 'engage_mode',
       type: 'string',
       description:
-        'When the agent engages. "mention" — only when @mentioned or in DMs. "mention-sticky" — once mentioned in a thread, the agent subscribes and responds to all subsequent messages in that thread without needing further mentions. "pattern" — matches every message against engage_pattern regex. Default: declared by the channel adapter for the target chat (DM vs group); "mention" when the channel has no declaration.',
-      enum: ['pattern', 'mention', 'mention-sticky'],
+        'When the agent engages. "mention" — only when @mentioned or in DMs. "mention-sticky" — once mentioned in a thread, the agent subscribes and responds to all subsequent messages in that thread without needing further mentions. "new-thread" — group chats only: responds to every new top-level thread (and to mentions), then to follow-ups in threads it has engaged; bot-authored and system messages engage only via a mention; requires honored thread ids, ignored_message_policy "drop", and a session_mode other than "agent-shared". "pattern" — matches every message against engage_pattern regex. Default: declared by the channel adapter for the target chat (DM vs group); "mention" when the channel has no declaration.',
+      enum: ['pattern', 'mention', 'mention-sticky', 'new-thread'],
       default: 'mention',
       updatable: true,
     },
@@ -80,7 +80,7 @@ registerResource({
       name: 'engage_pattern',
       type: 'string',
       description:
-        'Regex for engage_mode=pattern. Required when mode is pattern. Use "." to match every message (always-on). Ignored for mention modes.',
+        'Regex for engage_mode=pattern. Required when mode is pattern. Use "." to match every message (always-on). Ignored for other modes.',
       updatable: true,
     },
     {
@@ -154,7 +154,7 @@ registerResource({
     // hold session_mode='per-thread' with a false-resolving thread policy
     // (stamped before the coherence check existed). Don't reject unrelated
     // updates to them — enforce only when either side of the pairing changes.
-    if (updates.session_mode === undefined && updates.threads === undefined) {
+    if (updates.session_mode === undefined && updates.threads === undefined && merged.session_mode === 'per-thread') {
       merged.session_mode = undefined;
     }
     validateEngageAgainstChannel(merged, mg);

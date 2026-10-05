@@ -208,6 +208,38 @@ export function normalizeDmThreadId(threadId: string, messageId: string): string
   return threadId;
 }
 
+/** Decide whether a group message starts its thread. */
+export type ThreadRootDetector = (threadId: string, messageId: string) => boolean;
+
+/**
+ * Default thread-root check: chat-sdk adapters that key threads on the root
+ * message's id (e.g. Slack's thread ts) encode a top-level message's thread
+ * id with that same id as its last segment. Platforms that encode threads
+ * differently never match, so they fail closed unless they pass an override.
+ */
+export function isThreadRootMessage(threadId: string, messageId: string, override?: ThreadRootDetector): boolean {
+  if (override) return override(threadId, messageId);
+  return messageId !== '' && threadId.slice(threadId.lastIndexOf(':') + 1) === messageId;
+}
+
+/** Decide from a platform-specific raw message whether it is a system notice. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type SystemMessageDetector = (raw: Record<string, any>) => boolean;
+
+const USER_MESSAGE_SUBTYPES = new Set(['file_share', 'thread_broadcast', 'me_message']);
+
+/**
+ * Default system-message check: platforms that tag non-user messages with a
+ * string `subtype` on the raw event (e.g. Slack's pinned_item, reminder_add)
+ * leave it unset or set to a user subtype for messages a person wrote.
+ */
+export function detectSystemMessage(raw: unknown, override?: SystemMessageDetector): boolean | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  if (override) return override(raw as Record<string, unknown>);
+  const subtype = (raw as { subtype?: unknown }).subtype;
+  return typeof subtype === 'string' && subtype !== '' && !USER_MESSAGE_SUBTYPES.has(subtype);
+}
+
 /** Extract reply context from a platform-specific raw message. Return null if no reply. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type ReplyContextExtractor = (raw: Record<string, any>) => ReplyContext | null;
@@ -372,6 +404,16 @@ export interface ChatSdkBridgeConfig {
    * and reactions still target the head of the reply.
    */
   maxTextLength?: number;
+  /**
+   * Override the default thread-root check (isThreadRootMessage) for
+   * platforms whose thread ids don't end in the root message's id.
+   */
+  isThreadRoot?: ThreadRootDetector;
+  /**
+   * Override the default system-message check (detectSystemMessage) for
+   * platforms that mark system notices some other way than a raw `subtype`.
+   */
+  isSystemMessage?: SystemMessageDetector;
 }
 
 /**
@@ -486,6 +528,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     message: ChatMessage,
     isMention: boolean,
     isGroup?: boolean,
+    groupThreadId?: string,
   ): Promise<InboundMessage> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const serialized = message.toJSON() as Record<string, any>;
@@ -539,6 +582,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       serialized.senderName = name;
     }
 
+    const isBot = message.author?.isBot;
+    const systemMessage = detectSystemMessage(message.raw, config.isSystemMessage);
+
     // Drop raw to save DB space (can be very large)
     serialized.raw = undefined;
 
@@ -549,6 +595,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       timestamp: message.metadata.dateSent.toISOString(),
       isMention,
       isGroup,
+      isThreadRoot:
+        groupThreadId === undefined ? undefined : isThreadRootMessage(groupThreadId, message.id, config.isThreadRoot),
+      // The SDK reports 'unknown' when the platform can't tell.
+      isBotAuthor: typeof isBot === 'boolean' ? isBot : undefined,
+      isSystemMessage: systemMessage,
     };
   }
 
@@ -586,9 +637,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // Four SDK dispatch paths — bridge just forwards. All per-wiring
       // engage / accumulate / drop / subscribe decisions live in the host
       // router (src/router.ts routeInbound / evaluateEngage). The bridge
-      // only resolves channel ids and sets the platform-confirmed isMention
-      // flag that routeInbound evaluates; the router calls back into
-      // bridge.subscribe(...) when a mention-sticky wiring engages.
+      // only resolves channel ids and sets the platform-derived isMention,
+      // isThreadRoot, isBotAuthor and isSystemMessage flags that routeInbound
+      // evaluates; the router calls back into bridge.subscribe(...) when a
+      // mention-sticky wiring engages.
 
       // Subscribed threads — every message in a thread we've previously
       // engaged. Carry the SDK's `message.isMention` through so mention-mode
@@ -598,14 +650,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         await setupConfig.onInbound(
           channelId,
           thread.id,
-          await messageToInbound(message, message.isMention === true, true),
+          await messageToInbound(message, message.isMention === true, true, thread.id),
         );
       });
 
       // @mention in an unsubscribed thread — SDK-confirmed bot mention.
       chat.onNewMention(async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
-        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, true, true));
+        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, true, true, thread.id));
       });
 
       // DMs — by definition addressed to the bot. Thread id flows through
@@ -647,7 +699,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // flood gate.
       chat.onNewMessage(/[\s\S]*/, async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
-        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, false, true));
+        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, false, true, thread.id));
       });
 
       // Agent-mode assistant context: cache the latest "what the user is

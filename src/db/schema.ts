@@ -48,7 +48,7 @@ CREATE TABLE messaging_group_agents (
   messaging_group_id     TEXT NOT NULL REFERENCES messaging_groups(id),
   agent_group_id         TEXT NOT NULL REFERENCES agent_groups(id),
   engage_mode            TEXT NOT NULL DEFAULT 'mention',
-                         -- 'pattern' | 'mention' | 'mention-sticky'
+                         -- 'pattern' | 'mention' | 'mention-sticky' | 'new-thread'
   engage_pattern         TEXT,   -- regex; required when engage_mode='pattern';
                                  -- '.' means "match every message" (the "always" flavor)
   sender_scope           TEXT NOT NULL DEFAULT 'all',    -- 'all' | 'known'

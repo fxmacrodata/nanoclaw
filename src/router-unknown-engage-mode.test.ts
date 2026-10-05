@@ -1,6 +1,6 @@
 /**
- * evaluateEngage's default case: an engage_mode value that isn't one of the
- * three the type system allows ('pattern' | 'mention' | 'mention-sticky').
+ * evaluateEngage's default case: an engage_mode value that isn't one the
+ * EngageMode type allows.
  * The column has no DB CHECK constraint, so a stale row from a past CLI
  * version or a direct DB write can still carry an unrecognized value. That
  * must fail closed (never engage) but leave a diagnostic trail instead of

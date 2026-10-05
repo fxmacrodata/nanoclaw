@@ -4,7 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Adapter, AdapterPostableMessage, RawMessage } from 'chat';
 
-import { createChatSdkBridge, splitForLimit } from './chat-sdk-bridge.js';
+import type { InboundMessage } from './adapter.js';
+import { createChatSdkBridge, detectSystemMessage, isThreadRootMessage, splitForLimit } from './chat-sdk-bridge.js';
 
 vi.mock('../webhook-server.js', () => ({
   registerWebhookAdapter: vi.fn(),
@@ -282,6 +283,142 @@ describe('createChatSdkBridge.setup — webhook route and state namespace', () =
     const rows = await getDb().all<{ thread_id: string }>('SELECT thread_id FROM chat_sdk_subscriptions');
     expect(rows.map((r) => r.thread_id)).toEqual(['slack:T9']);
     await bridge.teardown();
+  });
+});
+
+describe('isThreadRootMessage', () => {
+  it('is true when the thread id ends in the message id', () => {
+    expect(isThreadRootMessage('slack:C1:1724264405.531769', '1724264405.531769')).toBe(true);
+  });
+
+  it('is false for a reply inside an existing thread', () => {
+    expect(isThreadRootMessage('slack:C1:1724264405.531769', '1724264999.000100')).toBe(false);
+  });
+
+  it('is false for an empty thread segment or empty message id', () => {
+    expect(isThreadRootMessage('slack:C1:', '')).toBe(false);
+    expect(isThreadRootMessage('slack:C1:', '1724264405.531769')).toBe(false);
+  });
+
+  it('defers to the configured override', () => {
+    expect(isThreadRootMessage('chan:C1', 'm1', () => true)).toBe(true);
+    expect(isThreadRootMessage('chan:C1:m1', 'm1', () => false)).toBe(false);
+  });
+});
+
+describe('detectSystemMessage', () => {
+  it('is undefined without a raw message', () => {
+    expect(detectSystemMessage(undefined)).toBeUndefined();
+  });
+
+  it('flags a raw subtype that is not a user message', () => {
+    expect(detectSystemMessage({ subtype: 'pinned_item' })).toBe(true);
+    expect(detectSystemMessage({ subtype: 'reminder_add' })).toBe(true);
+  });
+
+  it('does not flag a plain message or a user-written subtype', () => {
+    expect(detectSystemMessage({ text: 'hi' })).toBe(false);
+    expect(detectSystemMessage({ subtype: 'file_share' })).toBe(false);
+    expect(detectSystemMessage({ subtype: 'thread_broadcast' })).toBe(false);
+  });
+
+  it('defers to the configured override', () => {
+    expect(detectSystemMessage({ type: 'system_join' }, (raw) => raw.type === 'system_join')).toBe(true);
+    expect(detectSystemMessage({ subtype: 'pinned_item' }, () => false)).toBe(false);
+  });
+});
+
+describe('createChatSdkBridge — inbound author and thread signals', () => {
+  interface ChatDriver {
+    processMessage(adapter: Adapter, threadId: string, message: unknown): Promise<void>;
+  }
+
+  beforeEach(async () => {
+    const { initTestDb } = await import('../db/connection.js');
+    const { runMigrations } = await import('../db/migrations/index.js');
+    await runMigrations(await initTestDb());
+  });
+
+  afterEach(async () => {
+    const { closeDb } = await import('../db/connection.js');
+    await closeDb();
+  });
+
+  interface MessageOpts {
+    isBot?: boolean | 'unknown';
+    raw?: Record<string, unknown>;
+  }
+
+  function makeMessage(id: string, opts: MessageOpts = {}): Record<string, unknown> {
+    const author = { userId: 'U1', userName: 'h', isBot: opts.isBot ?? false, isMe: false };
+    const payload = { id, text: 'hello', author };
+    return {
+      ...payload,
+      attachments: [],
+      isMention: false,
+      metadata: { dateSent: new Date('2026-01-01T00:00:00.000Z') },
+      raw: opts.raw,
+      toJSON: () => ({ ...payload }),
+    };
+  }
+
+  async function inbound(
+    threadId: string,
+    messageId: string,
+    isThreadRoot?: (t: string, m: string) => boolean,
+    opts: MessageOpts & { isDM?: boolean } = {},
+  ) {
+    let chat: ChatDriver | null = null;
+    const adapter = stubAdapter({
+      name: 'slack',
+      initialize: async (c: unknown) => {
+        chat = c as ChatDriver;
+      },
+      channelIdFromThreadId: (t: string) => t.split(':').slice(0, 2).join(':'),
+      isDM: () => opts.isDM === true,
+    } as Partial<Adapter>);
+    const received: InboundMessage[] = [];
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true, isThreadRoot });
+    await bridge.setup({
+      onInbound: (_p, _t, message) => {
+        received.push(message);
+      },
+      onInboundEvent: () => {},
+      onMetadata: () => {},
+      onAction: () => {},
+    });
+    await chat!.processMessage(adapter, threadId, makeMessage(messageId, opts));
+    await bridge.teardown();
+    return received[0];
+  }
+
+  it('flags a top-level message as a thread root and a reply as not', async () => {
+    expect((await inbound('slack:C1:1700000000.000100', '1700000000.000100')).isThreadRoot).toBe(true);
+    expect((await inbound('slack:C1:1700000000.000100', '1700000000.000200')).isThreadRoot).toBe(false);
+  });
+
+  it('uses the configured isThreadRoot override', async () => {
+    expect((await inbound('slack:C1:1700000000.000100', '1700000000.000200', () => true)).isThreadRoot).toBe(true);
+  });
+
+  it('leaves isThreadRoot undefined on the DM path', async () => {
+    const message = await inbound('slack:D1:1700000000.000100', '1700000000.000100', undefined, { isDM: true });
+    expect(message.isThreadRoot).toBeUndefined();
+  });
+
+  // Distinct ids per call: the chat core dedupes on message id.
+  const reply = (n: number, opts: MessageOpts) =>
+    inbound('slack:C1:1700000000.000100', `1700000000.00020${n}`, undefined, opts);
+
+  it("carries the author's bot flag, and leaves it undefined when the platform can't tell", async () => {
+    expect((await reply(1, { isBot: false })).isBotAuthor).toBe(false);
+    expect((await reply(2, { isBot: true })).isBotAuthor).toBe(true);
+    expect((await reply(3, { isBot: 'unknown' })).isBotAuthor).toBeUndefined();
+  });
+
+  it('flags a system message from the raw event', async () => {
+    expect((await reply(1, { raw: { subtype: 'pinned_item' } })).isSystemMessage).toBe(true);
+    expect((await reply(2, { raw: { text: 'hello' } })).isSystemMessage).toBe(false);
   });
 });
 

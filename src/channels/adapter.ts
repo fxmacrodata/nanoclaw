@@ -72,6 +72,12 @@ export interface InboundEvent {
     isMention?: boolean;
     /** True when the source is a group/channel thread, false for DMs. */
     isGroup?: boolean;
+    /** See InboundMessage.isThreadRoot. */
+    isThreadRoot?: boolean;
+    /** See InboundMessage.isBotAuthor. */
+    isBotAuthor?: boolean;
+    /** See InboundMessage.isSystemMessage. */
+    isSystemMessage?: boolean;
   };
   replyTo?: DeliveryAddress;
 }
@@ -100,6 +106,24 @@ export interface InboundMessage {
   isMention?: boolean;
   /** True when the source is a group/channel thread, false for DMs. */
   isGroup?: boolean;
+  /**
+   * True when this message starts its thread (a new top-level message in a
+   * group channel), not a reply inside one. Drives engage_mode 'new-thread'.
+   * Undefined is treated as "not a root", so adapters that can't tell never
+   * trigger it.
+   */
+  isThreadRoot?: boolean;
+  /**
+   * True when the platform says a bot or integration wrote this message,
+   * false when it says a human did. Undefined: the adapter did not say.
+   */
+  isBotAuthor?: boolean;
+  /**
+   * True when the platform marks this as a system notice (pin, reminder,
+   * membership change, ...) rather than a message a user wrote; false for a
+   * plain user message. Undefined: the adapter did not say.
+   */
+  isSystemMessage?: boolean;
 }
 
 /** A file attachment to deliver alongside a message. */

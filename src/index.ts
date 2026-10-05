@@ -121,6 +121,9 @@ async function main(): Promise<void> {
                 timestamp: message.timestamp,
                 isMention: message.isMention,
                 isGroup: message.isGroup,
+                isThreadRoot: message.isThreadRoot,
+                isBotAuthor: message.isBotAuthor,
+                isSystemMessage: message.isSystemMessage,
               },
             }),
           )
